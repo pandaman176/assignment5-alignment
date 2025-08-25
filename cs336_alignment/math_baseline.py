@@ -64,6 +64,8 @@ def main():
     )
     test_data = dataset["test"]
 
+    print("Loaded", len(test_data), "examples")
+
     # format them as string prompts to the language model using the r1_zero prompt
     with open(PROMPT_PATH / "r1_zero.prompt", "r") as f:
         r1_zero_prompt_template = f.read()
@@ -79,7 +81,7 @@ def main():
             prompts.append(prompt)
             ground_truths.append(ground_truth)
 
-    print("Loaded", len(prompts), "examples")
+    print("Formatted", len(prompts), "examples")
 
     # analyze
     sampling_params = SamplingParams(
@@ -87,7 +89,7 @@ def main():
         stop=["</answer>"], include_stop_str_in_output=True
     )
 
-    llm = LLM( model= str(MODEL_PATH / "qwen-2.5-math-1.5b-r1-zero.ggmlv3.q4_0.bin") )
+    llm = LLM( model= "Qwen/Qwen2.5-Math-1.5B-Instruct" )
 
     save_path = str(LOG_PATH / "qwen-2.5-math-1.5b-r1-zero-eval.jsonl")
 
