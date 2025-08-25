@@ -10,6 +10,8 @@ import torch
 from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from cs336_alignment.common import MODEL_PATH
+
 
 def pytest_addoption(parser):
     parser.addoption("--snapshot-exact", action="store_true", help="Use exact matching standards for snapshot matching")
@@ -210,7 +212,7 @@ def output_strs():
 
 @pytest.fixture
 def model_id():
-    return "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
+    return str(MODEL_PATH / "Qwen2.5-Math-1.5B")
 
 
 @pytest.fixture
