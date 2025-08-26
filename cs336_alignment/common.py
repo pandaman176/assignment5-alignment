@@ -1,10 +1,11 @@
 import pathlib
 import socket
-from typing import Dict, List
+from typing import Dict, List, Callable, Literal
 
 import torch
 from transformers import PreTrainedTokenizerBase, AutoTokenizer, PreTrainedModel
 from torch.nn.utils.rnn import pad_sequence
+from einops import rearrange
 
 hostname = socket.gethostname()
 is_local: bool = "MacBook" in hostname
@@ -134,7 +135,7 @@ def get_response_log_probs(
     """
     logits = model(input_ids).logits # (batch_size, sequence_length, vocab_size)
     label_logits = logits.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1) # (batch_size, sequence_length)
-    log_probs = label_logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    log_probs = label_logits - torch.logsumexp(logits, dim=-1)
     if return_token_entropy:
         entropy = compute_entropy(logits)
         return {
@@ -152,7 +153,7 @@ def masked_normalize(
     mask: torch.Tensor,
     normalize_constant: float,
     dim: int | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """按掩码在给定维度求和并按常数归一化。
 
     功能：
@@ -177,6 +178,77 @@ def masked_normalize(
         dim = tuple(range(tensor.ndim))
     return tensor.masked_fill(~mask, 0).sum(dim=dim) / normalize_constant
 
+
+def compute_naive_policy_gradient_loss(
+    raw_rewards_or_advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """计算朴素策略梯度（每 token）损失的占位函数。
+
+    功能：
+        在强化学习微调中，给定每个样本的标量回报或已归一化优势
+        `raw_rewards_or_advantages`（形状为 (batch_size, 1)），以及策略在每个
+        token 位置的对数概率 `policy_log_probs`（形状为 (batch_size, sequence_length)），
+        该函数需返回逐 token 的策略梯度损失张量（形状为 (batch_size, sequence_length)）。
+
+    参数：
+        raw_rewards_or_advantages: torch.Tensor
+            形状为 (batch_size, 1) 的张量，代表每条响应的原始回报或已计算好的优势。
+        policy_log_probs: torch.Tensor
+            形状为 (batch_size, sequence_length) 的张量，代表策略在各 token 上的对数概率。
+
+    返回：
+        tuple[torch.Tensor, dict[str, torch.Tensor]]
+            - 第一个元素：形状为 (batch_size, sequence_length) 的逐 token 策略梯度损失。
+            - 第二个元素：包含统计信息的字典（如无可返回空字典）。
+
+    实现提示：
+        - 需要将 (batch_size, 1) 的回报/优势在 sequence_length 维上进行广播；
+        - 损失的符号约定通常为 `- advantage * log_prob` 的逐位置形式。
+    """
+    loss = -raw_rewards_or_advantages * policy_log_probs
+    return loss, {
+        "raw_rewards_or_advantages": raw_rewards_or_advantages,
+        "policy_log_probs": policy_log_probs,
+    }
+
+
+def compute_grpo_clip_loss(
+    advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    cliprange: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """计算 GRPO-Clip 的逐 token 损失（占位实现）。
+
+    功能：
+        - 给定每个样本的优势（形状为 (batch_size, 1)），以及新旧策略在每个 token 上的对数概率
+          `policy_log_probs` 与 `old_log_probs`（形状均为 (batch_size, sequence_length)），
+          按照 GRPO-Clip 公式计算逐 token 的损失；
+        - 返回逐 token 的损失张量与用于日志记录的元数据（例如是否发生裁剪等）。
+
+    参数：
+        advantages: torch.Tensor
+            形状为 (batch_size, 1) 的张量，表示每个响应的优势 A。
+        policy_log_probs: torch.Tensor
+            形状为 (batch_size, sequence_length) 的张量，正在训练策略的逐 token 对数概率。
+        old_log_probs: torch.Tensor
+            形状为 (batch_size, sequence_length) 的张量，旧策略的逐 token 对数概率。
+        cliprange: float
+            裁剪范围 ε（例如 0.2）。
+
+    返回：
+        tuple[torch.Tensor, dict[str, torch.Tensor]]
+            - 第一个元素：形状为 (batch_size, sequence_length) 的张量，逐 token 的 GRPO-Clip 损失；
+            - 第二个元素：包含用于日志记录的张量字典（例如裁剪标记、比例等）。
+    """
+    ratio = torch.exp(policy_log_probs - old_log_probs)
+    clip_ratio = torch.clamp(ratio, 1 - cliprange, 1 + cliprange)
+    loss = -torch.min(advantages * ratio, advantages * clip_ratio)
+    return loss, {
+        "ratio": ratio,
+        "clip_ratio": clip_ratio,
+    }
 
 
 def sft_microbatch_train_step(
@@ -244,8 +316,149 @@ def log_generation(
     outputs = model.generate(
         input_ids=input_ids,
     )
+    # TODO
     print(outputs)
 
+
+def compute_group_normalized_rewards(
+    reward_fn: Callable[[str, str], dict[str, float]],
+    rollout_responses: List[str],
+    repeated_ground_truths: List[str],
+    group_size: int,
+    advantage_eps: float,
+    normalize_by_std: bool,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """按组计算与归一化回报（占位实现）。
+
+    功能：
+        - 对每个 rollouts 响应与对应的重复 ground-truth 进行打分，得到原始回报 `raw_rewards`；
+        - 以 `group_size` 为分组粒度，在每个组内对回报做归一化（减去组均值，
+          若 `normalize_by_std=True` 则再除以组标准差与 `advantage_eps` 的和，
+          否则仅做中心化），得到 `advantages`；
+        - 返回组归一化后的 `advantages`、未归一化的 `raw_rewards` 以及可选的统计信息 `metadata`。
+
+    参数：
+        reward_fn: Callable[[str, str], dict[str, float]]
+            评分函数：输入 (response, ground_truth)；输出需包含键 "reward"、
+            "format_reward"、"answer_reward" 对应的浮点分数。
+        rollout_responses: list[str]
+            策略生成的响应序列，长度为 rollout_batch_size = n_prompts_per_rollout_batch * group_size。
+        repeated_ground_truths: list[str]
+            与 `rollout_responses` 等长的 ground-truth 列表（每个样本的 ground-truth 被重复 `group_size` 次）。
+        group_size: int
+            每个问题的分组大小（每组内的样本数）。
+        advantage_eps: float
+            防止除零的微小常数，参与标准差归一化时与组内标准差相加。
+        normalize_by_std: bool
+            若为 True，则在减去组均值后再除以 (组标准差 + advantage_eps)，否则仅减去组均值。
+
+    返回：
+        tuple[torch.Tensor, torch.Tensor, dict[str, float]]
+            - advantages: 形状为 (rollout_batch_size, ) 的张量，按组归一化后的回报。
+            - raw_rewards: 形状为 (rollout_batch_size, ) 的张量，未归一化的原始回报（未减去均值）。
+            - metadata: 额外日志统计（如各组的均值、标准差、min/max 等）。
+
+    """
+    # results = reward_fn(rollout_responses, repeated_ground_truths)
+    results = [reward_fn(response, ground_truth)["reward"] for response, ground_truth in zip(rollout_responses, repeated_ground_truths)]
+    flat_rewards = torch.tensor(results) # (n_prompts_per_rollout_batch * group_size, )
+    print(flat_rewards.shape, "flat_rewards")
+    rewards = rearrange(flat_rewards, "(n g) -> n g", g=group_size)
+    print(rewards)
+    print(rewards.shape, "rewards")
+    mean = rewards.mean(dim=-1, keepdim=True) # (n_prompts_per_rollout_batch, 1)
+    print(mean.shape, "mean")
+    std = rewards.std(dim=-1, keepdim=True) # (n_prompts_per_rollout_batch, 1)
+    raw_rewards = rewards - mean # (n_prompts_per_rollout_batch, group_size)
+    advantages = raw_rewards
+    if normalize_by_std:
+        advantages = advantages / (std + advantage_eps)
+    return advantages.flatten(), flat_rewards, {
+        "mean": mean,
+        "std": std,
+        "min": rewards.min(dim=-1).values,
+        "max": rewards.max(dim=-1).values,
+    }
+
+
+def compute_policy_gradient_loss(
+    policy_log_probs: torch.Tensor,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """选择并计算所需的策略梯度损失（逐 token），并返回辅助统计信息。
+
+    功能：
+        - 作为便捷包装器，根据 `loss_type` 分派到对应的损失例程：
+          - "no_baseline": 使用原始回报 `raw_rewards` 与 `policy_log_probs` 计算；
+          - "reinforce_with_baseline": 使用（已归一化）优势 `advantages` 与 `policy_log_probs` 计算；
+          - "grpo_clip": 使用 `advantages`、`policy_log_probs`、`old_log_probs` 与 `cliprange` 计算 GRPO-Clip。
+        - 返回逐 token 的损失张量与底层统计字典。
+
+    参数：
+        policy_log_probs: torch.Tensor
+            形状为 (batch_size, sequence_length)，正在训练策略的逐 token 对数概率。
+        loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"]
+            指定损失类型。
+        raw_rewards: torch.Tensor | None
+            当 `loss_type == "no_baseline"` 时必须提供；形状为 (batch_size, 1)。
+        advantages: torch.Tensor | None
+            当 `loss_type in {"reinforce_with_baseline", "grpo_clip"}` 时必须提供；形状为 (batch_size, 1)。
+        old_log_probs: torch.Tensor | None
+            当 `loss_type == "grpo_clip"` 时必须提供；形状为 (batch_size, sequence_length)。
+        cliprange: float | None
+            当 `loss_type == "grpo_clip"` 时必须提供；GRPO-Clip 的裁剪系数 ε。
+
+    返回：
+        tuple[torch.Tensor, dict[str, torch.Tensor]]
+            - 第一个元素：形状为 (batch_size, sequence_length) 的逐 token 损失。
+            - 第二个元素：底层统计信息（如比例、裁剪比例等），如无可返回空字典。
+
+    备注：
+        - 具体计算逻辑由你实现，可直接调用 `compute_naive_policy_gradient_loss` 或 `compute_grpo_clip_loss`。
+        - 建议在内部做参数断言（例如必需张量是否为 None、形状是否匹配等），并将底层元数据汇总为一个字典返回。
+    """
+    if loss_type == "no_baseline":
+        assert raw_rewards is not None
+        return compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs)
+    elif loss_type == "reinforce_with_baseline":
+        assert advantages is not None
+        return compute_naive_policy_gradient_loss(advantages, policy_log_probs)
+    elif loss_type == "grpo_clip":
+        assert advantages is not None
+        assert old_log_probs is not None
+        assert cliprange is not None
+        return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+    else:
+        raise ValueError(f"Invalid loss type: {loss_type}")
+
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+) -> torch.Tensor:
+    """计算张量在给定维度上的掩码均值。
+
+    功能：
+        计算张量在指定维度上的均值，但只考虑掩码为1（或True）的元素。
+        如果dim为None，则计算所有掩码元素的均值。
+
+    参数：
+        tensor: torch.Tensor
+            要进行均值计算的数据张量。
+        mask: torch.Tensor
+            与tensor同形状的布尔张量或0-1张量；值为1/True的位置参与均值计算。
+        dim: int | None
+            计算均值的维度。如果为None，则计算所有掩码元素的均值。
+
+    返回：
+        torch.Tensor
+            掩码均值；形状遵循tensor.mean(dim)的语义。
+    """
+    return tensor.masked_fill(~mask, 0).sum(dim=dim) / mask.sum(dim=dim)
 
 if __name__ == "__main__":
     prompt_strs = ["Hello, world"]
