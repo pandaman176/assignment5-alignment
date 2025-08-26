@@ -460,6 +460,56 @@ def masked_mean(
     """
     return tensor.masked_fill(~mask, 0).sum(dim=dim) / mask.sum(dim=dim)
 
+def grpo_microbatch_train_step(
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gradient_accumulation_steps: int,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """执行一次微批量（microbatch）的前向与反向步骤。
+
+    功能：
+        - 基于输入的逐 token 对数概率 `policy_log_probs` 与 `response_mask` 计算策略梯度损失；
+        - 仅在回复 token 位置（`response_mask == 1`）处累计损失；
+        - 结合 `gradient_accumulation_steps` 对损失进行缩放，并执行 `loss.backward()`；
+        - 返回标量损失与用于日志记录的元数据字典。
+
+    参数：
+        policy_log_probs: torch.Tensor
+            形状为 (batch_size, sequence_length)，正在训练策略的逐 token 对数概率。
+        response_mask: torch.Tensor
+            形状为 (batch_size, sequence_length)，1 表示回复 token，0 表示提示或补齐。
+        gradient_accumulation_steps: int
+            每次优化器 step 前要累计的微批量数。
+        loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"]
+            指定损失类型。
+        raw_rewards: torch.Tensor | None = None
+            当 `loss_type == "no_baseline"` 时必须提供；形状为 (batch_size, 1)。
+        advantages: torch.Tensor | None = None
+            当 `loss_type in {"reinforce_with_baseline", "grpo_clip"}` 时必须提供；形状为 (batch_size, 1)。
+        old_log_probs: torch.Tensor | None = None
+            当 `loss_type == "grpo_clip"` 时必须提供；形状为 (batch_size, sequence_length)。
+        cliprange: float | None = None
+            当 `loss_type == "grpo_clip"` 时必须提供；GRPO-Clip 的裁剪系数 ε。
+
+    返回：
+        tuple[torch.Tensor, dict[str, torch.Tensor]]
+            - 第一个元素：标量损失（已按梯度累积进行缩放，便于日志记录）。
+            - 第二个元素：包含底层统计量的字典（例如未缩放损失、token 级统计等）。
+
+    备注：
+        - 需要调用 `loss.backward()` 在此函数中。
+        - 确保调整梯度累积。
+    """
+    loss, metadata = compute_policy_gradient_loss(policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
+    loss = masked_mean(loss, response_mask) / gradient_accumulation_steps
+    loss.backward()
+    return loss, metadata
+
 if __name__ == "__main__":
     prompt_strs = ["Hello, world"]
     output_strs = ["Goodbye, world"]
